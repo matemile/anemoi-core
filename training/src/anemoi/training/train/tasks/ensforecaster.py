@@ -12,15 +12,13 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-import einops
 import torch
+from torch.distributed.distributed_c10d import ProcessGroup
 from torch.utils.checkpoint import checkpoint
 
-from anemoi.models.distributed.graph import gather_channels
 from anemoi.models.distributed.graph import gather_tensor
-from anemoi.models.distributed.graph import shard_channels
-from anemoi.models.distributed.shapes import apply_shard_shapes
 from anemoi.training.losses.scalers.base_scaler import AvailableCallbacks
+from anemoi.training.losses.wrappers.factory import WrappedLoss
 from anemoi.training.train.tasks.base import BaseGraphModule
 from anemoi.training.utils.inicond import EnsembleInitialConditions
 
@@ -28,7 +26,6 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
     from omegaconf import DictConfig
-    from torch.distributed.distributed_c10d import ProcessGroup
     from torch_geometric.data import HeteroData
 
 LOGGER = logging.getLogger(__name__)
@@ -116,20 +113,27 @@ class GraphEnsForecaster(BaseGraphModule):
 
         self.ensemble_ic_generator = EnsembleInitialConditions(config=config, data_indices=data_indices)
 
-        self.loss_trunc_matrices = self.build_loss_truncation_matrices(truncation_data)
+        # Ensure loss has a wrapper for consistency
+        self._ensure_loss_is_wrapped()
 
-    def build_loss_truncation_matrices(self, truncation_data: dict) -> None:
-        # we can't register these as buffers because DDP does not support sparse tensors
-        # these will be moved to the GPU when first used via sefl.interpolate_down/interpolate_up
-        loss_matrices = []
-        for i, interp_data_loss in enumerate(truncation_data["loss"]):
-            if interp_data_loss is not None:
-                loss_matrices.append(self.model.model._make_truncation_matrix(interp_data_loss))
-                LOGGER.info("Loss truncation: %s %s", i, loss_matrices[i].shape)
-            else:
-                loss_matrices.append(None)
-                LOGGER.info("Loss truncation: %s %s", i, None)
-        return loss_matrices
+    def _ensure_loss_is_wrapped(self) -> None:
+        """Ensure the loss has a wrapper for consistency.
+
+        If the loss comes from config with a wrapper (including multiscale
+        with truncation config), it's already set up properly.
+        If no wrapper exists, add IdentityWrapper for consistency.
+        """
+        from anemoi.training.losses.wrappers import IdentityWrapper
+
+        if isinstance(self.loss, WrappedLoss):
+            # Loss is already wrapped from config
+            wrapper_name = type(self.loss.wrapper).__name__
+            LOGGER.info("Loss has %s wrapper from config", wrapper_name)
+            # Multiscale wrapper now handles interpolation internally
+        else:
+            # No wrapper from config - add IdentityWrapper for consistency
+            self.loss = WrappedLoss(self.loss, IdentityWrapper())
+            LOGGER.info("Added IdentityWrapper for consistency (no wrapper in config)")
 
     def forward(self, x: torch.Tensor, fcstep: int) -> torch.Tensor:
         return self.model(
@@ -166,48 +170,6 @@ class GraphEnsForecaster(BaseGraphModule):
         self.ens_comm_subgroup_rank = ens_comm_subgroup_rank
         self.ens_comm_subgroup_num_groups = ens_comm_subgroup_num_groups
         self.ens_comm_subgroup_size = ens_comm_subgroup_size
-
-    def _prepare_for_truncation(
-        self,
-        y_pred_ens: torch.Tensor,
-        y: torch.Tensor,
-        model_comm_group: ProcessGroup,
-    ) -> tuple[torch.Tensor, torch.Tensor, tuple | None]:
-        """Prepare tensors for interpolation/smoothing.
-
-        Args:
-            y_pred_ens: torch.Tensor
-                Ensemble predictions
-            y: torch.Tensor
-                Ground truth
-            model_comm_group: ProcessGroup
-                Model communication group
-
-        Returns
-        -------
-            y_pred_ens_interp: torch.Tensor
-                Predictions for interpolation
-            y_interp: torch.Tensor
-                Ground truth for interpolation
-            shard_info: tuple
-                Shard shapes for later gathering
-        """
-        batch_size, ensemble_size = y_pred_ens.shape[0], y_pred_ens.shape[1]
-
-        y_pred_ens_interp = einops.rearrange(y_pred_ens, "b e g c -> (b e) g c")
-        shard_shapes = apply_shard_shapes(y_pred_ens_interp, self.grid_dim, self.grid_shard_shapes)
-        y_pred_ens_interp = shard_channels(y_pred_ens_interp, shard_shapes, model_comm_group)
-        y_pred_ens_interp = einops.rearrange(
-            y_pred_ens_interp,
-            "(b e) g c -> b e g c",
-            b=batch_size,
-            e=ensemble_size,
-        )
-
-        shard_shapes_y = apply_shard_shapes(y, self.grid_dim, self.grid_shard_shapes)
-        y_interp = shard_channels(y, shard_shapes_y, model_comm_group)
-
-        return y_pred_ens_interp, y_interp, shard_shapes, shard_shapes_y
 
     def gather_and_compute_loss(
         self,
@@ -254,70 +216,28 @@ class GraphEnsForecaster(BaseGraphModule):
             mgroup=ens_comm_subgroup,
         )
 
-        is_multi_scale_loss = any(x is not None for x in self.loss_trunc_matrices)
-        shard_shapes, shard_shapes_y = None, None
-        if self.keep_batch_sharded and is_multi_scale_loss:
-            # go to full sequence dimension for interpolation / smoothing
-            y_pred_ens_interp, y_for_interp, shard_shapes, shard_shapes_y = self._prepare_for_truncation(
-                y_pred_ens,
-                y,
-                model_comm_group,
-            )
-        else:
-            y_pred_ens_interp = y_pred_ens
-            y_for_interp = y
+        # The loss should always be wrapped (set up in __init__ via _setup_multiscale_loss_wrapper)
+        assert isinstance(
+            loss, WrappedLoss,
+        ), "Loss should be wrapped. Ensure _setup_multiscale_loss_wrapper() was called."
 
-        loss_inc = []
-        y_preds_ens = []
-        ys = []
-        for i, trunc_matrix in enumerate(self.loss_trunc_matrices):
-            LOGGER.debug(
-                "Loss: %s %s %s",
-                i,
-                trunc_matrix.shape if trunc_matrix is not None else None,
-                trunc_matrix.device if trunc_matrix is not None else None,
-            )
+        loss_result = loss(
+            y_pred_ens,
+            y,
+            squash=True,
+            grid_shard_slice=self.grid_shard_slice,
+            group=model_comm_group,
+            return_all_scales=has_multiple_outputs,  # Only get individual losses for multi-output wrappers
+            # Parameters for distributed truncation (handled by MultiScaleWrapper if needed)
+            model_comm_group=model_comm_group,
+            grid_dim=self.grid_dim,
+            grid_shard_shapes=self.grid_shard_shapes,
+            keep_batch_sharded=self.keep_batch_sharded,
+        )
 
-            # interpolate / smooth the predictions and the truth for loss computation
-            y_pred_ens_tmp, y_tmp = self._interp_for_loss(y_pred_ens_interp, y_for_interp, i)
-
-            if self.keep_batch_sharded and is_multi_scale_loss:
-                y_pred_ens_tmp = gather_channels(y_pred_ens_tmp, shard_shapes, model_comm_group)
-                y_tmp = gather_channels(y_tmp, shard_shapes_y, model_comm_group)
-
-            # save for next loss scale
-            y_preds_ens.append(y_pred_ens_tmp)
-            ys.append(y_tmp)
-
-            if i > 0:  # assumption, resol 0 < 1 < 2 < ... < n
-                y_pred_ens_tmp = y_pred_ens_tmp - y_preds_ens[i - 1]
-                y_tmp = y_tmp - ys[i - 1]
-
-            # compute the loss
-            loss_inc.append(
-                loss(
-                    y_pred_ens_tmp,
-                    y_tmp,
-                    squash=True,
-                    grid_shard_slice=self.grid_shard_slice,
-                    group=model_comm_group,
-                ),
-            )
+        loss_inc = loss_result if isinstance(loss_result, list) else [loss_result]
 
         return loss_inc, y_pred_ens if return_pred_ens else None
-
-    def _interp_for_loss(self, x: torch.Tensor, y: torch.Tensor, i: int) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.loss_trunc_matrices[i] is not None:
-            self.loss_trunc_matrices[i] = self.loss_trunc_matrices[i].to(x.device)
-            x = self._interpolate_batch(x, self.loss_trunc_matrices[i])
-            y = self._interpolate_batch(y, self.loss_trunc_matrices[i])
-        return x, y
-
-    def _interpolate_batch(self, batch: torch.Tensor, intp_matrix: torch.Tensor) -> torch.Tensor:
-        input_shape = batch.shape  # e.g. (batch steps ensemble grid vars) or (batch steps grid vars)
-        batch = batch.reshape(-1, *input_shape[-2:])
-        batch = self.model.model._truncate_fields(batch, intp_matrix)  # to coarse resolution
-        return batch.reshape(*input_shape)
 
     def advance_input(
         self,
@@ -471,9 +391,10 @@ class GraphEnsForecaster(BaseGraphModule):
         )
 
         loss = torch.zeros(1, dtype=batch[0].dtype, device=self.device, requires_grad=False)
+        # Get number of scales/outputs from the wrapper (loss is always wrapped)
+        num_outputs = self.loss.wrapper.num_outputs
         mloss = [
-            torch.zeros(1, dtype=batch[0].dtype, device=self.device, requires_grad=False)
-            for _ in self.loss_trunc_matrices
+            torch.zeros(1, dtype=batch[0].dtype, device=self.device, requires_grad=False) for _ in range(num_outputs)
         ]
         metrics = {}
         y_preds = []

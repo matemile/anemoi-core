@@ -19,6 +19,8 @@ from anemoi.models.data_indices.collection import IndexCollection
 from anemoi.models.data_indices.tensor import OutputTensorIndex
 from anemoi.training.losses.base import BaseLoss
 from anemoi.training.losses.scaler_tensor import TENSOR_SPEC
+from anemoi.training.losses.wrappers.factory import WrappedLoss
+from anemoi.training.losses.wrappers.factory import get_loss_wrapper
 from anemoi.training.utils.variables_metadata import ExtractVariableGroupAndLevel
 
 METRIC_RANGE_DTYPE = dict[str, list[int]]
@@ -65,6 +67,9 @@ def get_loss_function(
     loss_config = OmegaConf.to_container(config, resolve=True)
     scalers_to_include = loss_config.pop("scalers", [])
 
+    # Extract wrapper configuration if present
+    wrapper_config = loss_config.pop("wrapper", None)
+
     if scalers is None:
         scalers = {}
 
@@ -92,6 +97,13 @@ def get_loss_function(
 
         if hasattr(loss_function, "set_data_indices"):
             loss_function.set_data_indices(data_indices)
+
+    # Apply wrapper if configured
+    assert wrapper_config is not None, "Wrapper config should be provided to apply a loss wrapper."
+    if wrapper_config is not None:
+        LOGGER.debug("Applying loss wrapper with config: %s", wrapper_config)
+        wrapper = get_loss_wrapper(wrapper_config)
+        loss_function = WrappedLoss(loss_function, wrapper)
 
     return loss_function
 
