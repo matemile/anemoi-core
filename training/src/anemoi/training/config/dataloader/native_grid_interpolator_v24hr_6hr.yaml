@@ -1,0 +1,215 @@
+prefetch_factor: 2
+pin_memory: True
+
+# ============
+# read_group_size:
+#   Form subgroups of model comm groups that read data together.
+#   Each reader in the group only reads 1/read_group_size of the data
+#   which is then all-gathered between the group.
+#   This can reduce CPU memory usage as well as increase dataloader throughput.
+#   The number of GPUs per model must be divisible by read_group_size.
+#   To disable, set to 1.
+# ============
+read_group_size: ${hardware.num_gpus_per_model}
+
+num_workers:
+  training: 8
+  validation: 8
+  test: 8
+batch_size:
+  training: 8
+  validation: 8
+  test: 4
+
+# ============
+# Default effective batch_size for training is 16
+# For the o96 resolution, default per-gpu batch_size is 2 (8 gpus required)
+# The global lr is calculated as:
+# global_lr = local_lr * num_gpus_per_node * num_nodes / gpus_per_model
+# Assuming a constant effective batch_size, any change in the per_gpu batch_size
+# should come with a rescaling of the local_lr to keep a constant global_lr
+# ============
+
+# runs only N training batches [N = integer | null]
+# if null then we run through all the batches
+limit_batches:
+  training: 10000
+  validation: 512
+  test: 20
+
+# set a custom mask for grid points.
+# Useful for LAM (dropping unconnected nodes from forcing dataset)
+grid_indices:
+  _target_: anemoi.training.data.grid_indices.FullGrid
+  nodes_name: ${graph.data}
+
+# ============
+# Dataloader definitions
+# These follow the anemoi-datasets patterns
+# You can make these as complicated for merging as you like
+# See https://anemoi-datasets.readthedocs.io
+# ============
+
+dataset: ${hardware.paths.data}${hardware.files.dataset}
+dataset_s2s: ${hardware.paths.data}${hardware.files.dataset_s2s}
+dataset_24_accums: ${hardware.paths.data}${hardware.files.dataset_24_accums}
+
+
+# THE 24HR model is trained until end of  2017
+train_start: '1979-01-01'
+train_end: '2017-12-31'
+val_start: '2018-01-01'
+val_end: '2022-12-31'
+test_start: '2023'
+test_end: '2023'
+
+training:
+  dataset:
+   join:
+    - 
+      dataset: ${dataloader.dataset}
+      start: ${dataloader.train_start}
+      end: ${dataloader.train_end}
+      frequency: ${data.frequency}
+      drop: []
+    -
+      dataset: ${dataloader.dataset_s2s}
+      start: ${dataloader.train_start}
+      end: ${dataloader.train_end}
+      drop: ${dataloader.s2s_drop}
+    -
+      dataset: ${dataloader.dataset_24_accums}
+      start: ${dataloader.train_start}
+      end: ${dataloader.train_end}
+      select: ${dataloader.select_24_accums}
+      rename: ${dataloader.rename_24_accums}
+  start: ${dataloader.train_start}
+  end: ${dataloader.train_end}
+
+validation:
+  dataset:
+   join:
+    - 
+      dataset: ${dataloader.dataset}
+      start: ${dataloader.val_start}
+      end: ${dataloader.val_end}
+      frequency: ${data.frequency}
+      drop: []
+    -
+      dataset: ${dataloader.dataset_s2s}
+      start: ${dataloader.val_start}
+      end: ${dataloader.val_end}
+      drop: ${dataloader.s2s_drop}
+    -
+      dataset: ${dataloader.dataset_24_accums}
+      start: ${dataloader.val_start}
+      end: ${dataloader.val_end}
+      select: ${dataloader.select_24_accums}
+      rename: ${dataloader.rename_24_accums}
+  start: ${dataloader.val_start}
+  end: ${dataloader.val_end}
+
+validation_rollout: 1 # number of rollouts to use for validation, must be equal or greater than rollout expected by callbacks
+
+test:
+  dataset:
+   join:
+    - 
+      dataset: ${dataloader.dataset}
+      start: ${dataloader.test_start}
+      end: ${dataloader.test_end}
+      frequency: ${data.frequency}
+      drop: []
+    -
+      dataset: ${dataloader.dataset_s2s}
+      start: ${dataloader.test_start}
+      end: ${dataloader.test_end}
+      drop: ${dataloader.s2s_drop}
+    -
+      dataset: ${dataloader.dataset_24_accums}
+      start: ${dataloader.test_start}
+      end: ${dataloader.test_end}
+      select: ${dataloader.select_24_accums}
+      rename: ${dataloader.rename_24_accums}
+  start: ${dataloader.test_start}
+  end: ${dataloader.test_end}
+
+
+
+select_24_accums: 
+  - cp
+  - sf
+  - ssrd
+  - strd
+  - tp
+  - ttr
+
+rename_24_accums:
+  cp: cp_accum
+  sf: sf_accum
+  ssrd: ssrd_accum
+  strd: strd_accum
+  tp: tp_accum
+  ttr: ttr_accum
+
+
+s2s_drop:
+  - "cos_julian_day"
+  - "cos_latitude"
+  - "cos_local_time"
+  - "cos_longitude"
+  - "insolation"
+  - "sin_julian_day"
+  - "sin_latitude"
+  - "sin_local_time"
+  - "sin_longitude"
+  - "ro"
+  - "sd"
+  - "lsf"
+  - "csf"
+  - "lsp"
+  - "q_1"
+  - "q_10"
+  - "q_2"
+  - "q_30"
+  - "q_5"
+  - "q_70"
+  - "t_1"
+  - "t_10"
+  - "t_2"
+  - "t_30"
+  - "t_5"
+  - "t_70"
+  - "u_1"
+  - "u_10"
+  - "u_2"
+  - "u_30"
+  - "u_5"
+  - "u_70"
+  - "v_1"
+  - "v_10"
+  - "v_2"
+  - "v_30"
+  - "v_5"
+  - "v_70"
+  - "w_1"
+  - "w_10"
+  - "w_2"
+  - "w_30"
+  - "w_5"
+  - "w_70"
+  - "z_1"
+  - "z_10"
+  - "z_2"
+  - "z_30"
+  - "z_5"
+  - "z_70"
+  - "sst"
+  - "ci"
+  - "slt"
+  - "stl1"
+  - "stl2"
+  - "stl3"
+  - "swvl1"
+  - "swvl2"
+  - "swvl3"

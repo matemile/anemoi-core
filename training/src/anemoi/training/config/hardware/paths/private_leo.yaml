@@ -1,0 +1,16 @@
+data: /leonardo_scratch/large/userexternal/malexe00/aifs-input/o96
+# data: /leonardo/home/userexternal/fpinault/ai-ml/datasets/stable/
+data_experimental: /leonardo_scratch/large/userexternal/malexe00/aifs-input/o96
+# data_experimental: /leonardo/home/userexternal/fpinault/ai-ml/datasets/experimental/
+output: ${oc.env:SCRATCH}/aifs-output/
+logs:
+  base: ${hardware.paths.output}/logs
+  wandb: ${hardware.paths.logs.base}
+  tensorboard: ${hardware.paths.logs.base}/tensorboard
+  profiler: ${hardware.paths.output}/profiler
+  mlflow: ${hardware.paths.logs.base}/mlflow
+checkpoints: ${hardware.paths.output}/checkpoint
+plots: ${hardware.paths.output}/plots
+# graph: /leonardo_scratch/large/userexternal/mclare00
+# graph: /leonardo_scratch/large/userexternal/slang000/graphs
+graph: /leonardo_scratch/large/userexternal/mclare00

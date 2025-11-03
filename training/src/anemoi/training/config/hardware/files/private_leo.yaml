@@ -1,0 +1,11 @@
+dataset: aifs-ea-an-oper-0001-mars-${data.resolution}-1979-2023-6h-v7.zarr
+graph: null
+checkpoint:
+  every_n_epochs: aifs-by_epoch-epoch_{epoch:03d}-step_{step:06d}
+  every_n_train_steps: aifs-by_step-epoch_{epoch:03d}-step_{step:06d}
+  every_n_minutes: aifs-by_time-epoch_{epoch:03d}-step_{step:06d}
+warm_start: null
+
+# Transformer - graph_mappings_normed_edge_attrs_20231121125206_${data.resolution}_h_o48.pt
+# GraphTrasnformer - graph_mappings_normed_edge_attrs_ordered_desc_lat_lon_20231122093910_${data.resolution}_h_o48.pt
+#  GNN - graph_mappings_normed_edge_attrs_ordered_desc_lat_lon_20231122093910_${data.resolution}_h_0_1_2_3_4_5.pt
