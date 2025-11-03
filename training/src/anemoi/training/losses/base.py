@@ -151,6 +151,7 @@ class BaseLoss(nn.Module, ABC):
             If "avg", the last dimension is averaged.
             If "sum", the last dimension is summed.
 
+
         Returns
         -------
         torch.Tensor

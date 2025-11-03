@@ -104,7 +104,7 @@ class ExplicitTimes(BaseModel):
         tgt = self.target
         if len(inp) == 0 or len(tgt) == 0:
             return self
-        if min(inp) >= min(tgt) or max(inp) <= max(tgt):
+        if min(inp) >= min(tgt) or max(inp) < max(tgt):
             error_msg = """training.explicit_times.target must be strictly within the bounds of
             training.explicit_times.input (min(input) < min(target) and max(input) > max(target))"""
             raise ValueError(

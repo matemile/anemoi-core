@@ -1,6 +1,6 @@
 ---
 defaults:
-  - scalers: global
+  - scalers: global_interpolator
 
 # resume or fork a training from a checkpoint last.ckpt or specified in hardware.files.warm_start
 run_id: null
@@ -24,7 +24,7 @@ multistep_input: 2
 # the effective batch size becomes num-devices * batch_size * k
 accum_grad_batches: 1
 
-num_sanity_val_steps: 6
+num_sanity_val_steps: 0
 
 # clipp gradients, 0 : don't clip, default algorithm: norm, alternative: value
 gradient_clip:
@@ -79,6 +79,31 @@ training_loss:
   # add `!scaler_name`, i.e. ['*', '!scaler_1'], and `scaler_1` will not be added.
   scalers: ['pressure_level', 'general_variable', 'nan_mask_weights', 'node_weights']
   ignore_nans: False
+
+
+# Optional auxiliary temporal distribution loss on accumulated variables
+# If provided, its scalers will be attached via the same mechanism as training_loss
+# and variable/spatial/node scalers will apply appropriately. Keep the list to scalers
+# available in the training.scalers section to avoid config errors.
+temporal_distribution_loss:
+  _target_: anemoi.training.losses.TemporalDistributionCrossEntropyLoss
+  # Use only grid-level scaler to avoid var-dim mismatch (CE uses only accumulated vars)
+  scalers: ['accumulated_variable', 'node_weights']
+  # --- Optional ratio-focal modulation over time (defaults keep it disabled) ---
+  focal_gamma: 0.0       # >0 to enable ratio-focal weighting, e.g. 1.0–2.0
+  # Optional per-variable overrides by output variable name (e.g., 'tp', 'cp', 'sf')
+  focal_gamma_per_var: {}  # { tp: 2.0, cp: 1.5, sf: 2.5 }
+  # --- Optional shift-tolerant alignment for timing jitter (disabled by default) ---
+  shift_alignment:
+    enabled: false       # set true to enable temporal shift alignment
+    shifts: [-1, 0, 1]   # allowable temporal shifts in hours/steps
+    aggregation: softmin # one of: softmin|min|mean
+    beta: 5.0            # softmin temperature; larger -> closer to hard min
+    renormalize: false    # for baseline zero-pad mode: renormalize over full window
+    coverage_weighted_conditional: true  # Variant B: use overlap-only conditional CE weighted by target coverage
+    variables: []        # e.g. ['tp', 'cp', 'sf']
+
+temporal_distribution_loss_weight: 0.0
 
 # Validation metrics calculation,
 # This may be a list, in which case all metrics will be calculated

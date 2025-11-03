@@ -53,7 +53,7 @@ class AnemoiModelEncProcDecInterpolator(AnemoiModelEncProcDec):
         """
         model_config = DotDict(model_config)
         self.num_target_forcings = (
-            len(model_config.training.target_forcing.data) + model_config.training.target_forcing.time_fraction
+            len(model_config.training.target_forcing.data) + model_config.training.target_forcing.time_fraction * 8
         )
         self.num_input_times = len(model_config.training.explicit_times.input)
         super().__init__(
@@ -274,6 +274,7 @@ class AnemoiModelEncProcDecInterpolator(AnemoiModelEncProcDec):
                 y_preds[:, i] = y_pred
 
             include_right_boundary = kwargs.get("include_right_boundary", False)
+            raise NotImplementedError("Mass conservation is not implemented for the full rollout version.")
             if self.map_accum_indices is not None:
 
                 y_preds = self.resolve_mass_conservations(
@@ -293,7 +294,17 @@ class AnemoiModelEncProcDecInterpolator(AnemoiModelEncProcDec):
 
         return y_preds
 
-    def resolve_mass_conservations(self, y_preds, x_input, include_right_boundary=False) -> torch.Tensor:
+    def resolve_mass_conservations(
+        self,
+        y_preds,
+        x_input,
+        include_right_boundary: bool = True,
+        *,
+        return_weights: bool = False,
+        return_logits: bool = False,
+        return_log_weights: bool = False,
+        return_scales: bool = False,
+    ) -> dict[str, torch.Tensor]:
         """Enforce a "mass conservation" style constraint on a subset of output variables by
         redistributing a known total (taken from the input constraints) across the time
         dimension using softmax weights derived from the model's logits.
@@ -312,16 +323,21 @@ class AnemoiModelEncProcDecInterpolator(AnemoiModelEncProcDec):
                 *right-boundary* (last time slice) constraint values from:
                     x_input[:, -1:, ..., input_constraint_indxs]
                 yielding shape (B, 1, E, G, V_acc).
-            include_right_boundary (bool):
+            include_right_boundary (bool): (this is now whether or not to update the right boundary)
                 If False: distribute the constraint over the existing T steps.
                 If True:  append an extra (T+1)-th step representing the right boundary and
                         distribute over T+1 steps; also copy non-target outputs at that
                         boundary from inputs.
+            return_weights (bool): If True, include softmax weights across time under key "weights".
+            return_logits (bool): If True, include raw logits under key "logits".
+            return_log_weights (bool): If True, include log-softmax weights across time under key "log_weights".
+            return_scales (bool): If True, include the final per-variable softmax scales under key "scales".
 
         Returns:
-            torch.Tensor: Updated y_preds with target outputs replaced by a constrained,
-                        softmax-weighted allocation that conserves the total "mass".
+            dict[str, torch.Tensor]: A dictionary that always contains key "y_preds" (updated outputs),
+            and optionally includes any of "weights", "log_weights", and "logits" depending on the flags.
         """
+        update_right_boundary = include_right_boundary
 
         # Indices mapping:
         # - input_constraint_indxs: channels in x_input containing the total "mass" to conserve
@@ -330,71 +346,57 @@ class AnemoiModelEncProcDecInterpolator(AnemoiModelEncProcDec):
         target_indices = self.map_accum_indices["target_idxs"]
 
         # Extract logits for the "accumulated" target variables: (B, T, E, G, V_acc)
-        logits = y_preds[..., target_indices]
+        logits = y_preds[..., target_indices].clone()
+        # Stabilize softmax by removing per-sample time-mean; improves gradient flow
+        logits = logits - logits.mean(dim=1, keepdim=True)
 
-        # Create a zero "anchor" slice along the time axis (B, 1, E, G, V_acc).
-        # Appending this before softmax creates T+1 slots whose weights sum to 1.
-        # The last slot can represent the right-boundary share.
-        zeros = torch.zeros_like(logits[:, 0:1])
-
-        # Compute normalized weights along time: (B, T+1, E, G, V_acc)
-        # Note: softmax dim=1 (time). Weights across time sum to 1 per (B, E, G, V_acc).
-        weights = F.softmax(torch.cat([logits, zeros], dim=1), dim=1)
-
-        if not include_right_boundary:
-            # We are *not* including the explicit right-boundary step in the output,
-            # so drop the last (boundary) slot and keep T weights: (B, T, E, G, V_acc)
-            weights = weights[:, :-1]
-
-            # The constraint "total mass" comes from the *last* input time slice:
-            # shape (B, 1, E, G, V_acc). This broadcasts over time when multiplied by weights.
-            constraints = x_input[:, -1:, ..., input_constraint_indxs]
-
-            # Replace target outputs with the softmax-weighted allocation of the constraint.
-            # For each (B, E, G, V_acc), the T values sum to <= the total constraint because
-            # we dropped the (T+1)-th boundary slot.
-            y_preds[..., target_indices] = weights * constraints
-
+        # Apply per-variable softmax scale (inverse temperature) via sigmoid-bounded parameterization
+        # scales: (V_acc,) -> broadcast to (1, 1, 1, 1, V_acc)
+        if all(k in self.map_accum_indices for k in ("scale_unconstrained", "scale_min", "scale_max")):
+            w = self.map_accum_indices["scale_unconstrained"]
+            s_min = self.map_accum_indices["scale_min"]
+            s_max = self.map_accum_indices["scale_max"]
+            scales = s_min + (s_max - s_min) * torch.sigmoid(w)
         else:
-            # --- Include the right boundary as an explicit (T+1)-th step ---
+            # Fallback to scale 1.0 if not configured
+            scales = torch.ones((logits.shape[-1],), device=logits.device, dtype=logits.dtype)
+        scaled_logits = logits * scales.view(*(1,) * (logits.ndim - 1), -1)
 
-            # Identify output channels that are *not* in the target set,
-            # so we can copy their right-boundary values from inputs.
-            y_index_ex_target_indices = [
-                outp_idx
-                for vname, outp_idx in self.data_indices.model.output.name_to_index.items()
-                if outp_idx not in target_indices
-            ]
+        # Compute normalized weights along time on scaled logits: (B, T, E, G, V_acc)
+        # Note: softmax dim=1 (time). Weights across time sum to 1 per (B, E, G, V_acc).
+        weights = F.softmax(scaled_logits, dim=1)
 
-            # Map those same (non-target) outputs to their positions in the model *input*
-            # so we can source their boundary values from x_input.
-            data_indices_model_input_model_output = [
-                self.data_indices.model.input.name_to_index[vname]
-                for vname, outp_idx in self.data_indices.model.output.name_to_index.items()
-                if outp_idx not in target_indices
-            ]
+        # The constraint "total mass" comes from the *last* input time slice:
+        # shape (B, 1, E, G, V_acc). This broadcasts over time when multiplied by weights.
+        # Detach to prevent gradients flowing into x_input/boundaries.
+        constraints = x_input[:, -1:, ..., input_constraint_indxs].detach()
 
-            # Append an all-zero frame along time so y_preds has T+1 steps,
-            # matching the weights shape (B, T+1, E, G, V_*).
-            y_preds = torch.cat([y_preds, torch.zeros_like(y_preds[:, 0:1])], dim=1)
+        # eps = 1e-6  # gate tiny totals
+        # small = constraints.abs() < eps
 
-            # Right-boundary constraint totals (B, 1, E, G, V_acc)
-            constraints = x_input[:, -1:, ..., input_constraint_indxs]
+        if update_right_boundary:
+            y_constrained = constraints * weights
+            # y_constrained = torch.where(small, 0.0, y_constrained) # When overall amount is 0, we don't need a gradient signal since any dissagregation will be 0 at all times
 
-            # Allocate constraint across T+1 steps for the target variables.
-            # For each (B, E, G, V_acc), these (T+1) values sum to the total constraint.
-            y_preds_accum = weights * constraints  # (B, T+1, E, G, V_acc)
+            y_preds[..., target_indices] = y_constrained
+        else:
+            y_constrained = weights[:, :-1] * constraints
+            # y_constrained = torch.where(small.expand_as(y_constrained), y_preds[:, :-1, ..., target_indices], y_constrained)
+            y_preds[:, :-1, ..., target_indices] = y_constrained
 
-            # For *non-target* variables, set the (T+1)-th step to the right-boundary input values.
-            # This preserves/copies boundary conditions for outputs we are not re-allocating.
-            y_preds[:, -1:, ..., y_index_ex_target_indices] = x_input[
-                :, -1:, ..., data_indices_model_input_model_output
-            ]
+        # Compose return dictionary
+        result: dict[str, torch.Tensor] = {"y_preds": y_preds}
+        if return_weights:
+            result["weights"] = weights
+        if return_log_weights:
+            result["log_weights"] = F.log_softmax(scaled_logits, dim=1)
+        if return_logits:
+            # Return the centered, scaled logits used to compute the weights
+            result["logits"] = scaled_logits
+        if return_scales:
+            result["scales"] = scales
 
-            # Write the allocated values back into the target channels across all T+1 steps.
-            y_preds[..., target_indices] = y_preds_accum
-
-        return y_preds
+        return result
 
     def setup_mass_conserving_accumulations(self, data_indices: dict, config: dict):
 
@@ -407,6 +409,19 @@ class AnemoiModelEncProcDecInterpolator(AnemoiModelEncProcDec):
         else:
             target_idx_list: list[int] = []
             constraint_idx_list: list[int] = []
+            scale_list: list[float] = []
+            scale_min_list: list[float] = []
+            scale_max_list: list[float] = []
+
+            # Read per-variable scale configuration (inverse temperature for softmax)
+            default_scale = getattr(config.model, "mass_conserving_softmax_default_scale", 1.0)
+            per_var_scales = getattr(config.model, "mass_conserving_softmax_scales", {}) or {}
+
+            # Default bounds and per-variable bounds for sigmoid-bounded scales
+            default_min = getattr(config.model, "mass_conserving_softmax_default_min_scale", 0.5)
+            default_max = getattr(config.model, "mass_conserving_softmax_default_max_scale", 10.0)
+            bounds_map = getattr(config.model, "mass_conserving_softmax_scale_bounds", {}) or {}
+
             for output_varname, input_constraint_varname in self.map_mass_conserving_accums.items():
                 assert (
                     input_constraint_varname in data_indices.data._forcing
@@ -418,6 +433,41 @@ class AnemoiModelEncProcDecInterpolator(AnemoiModelEncProcDec):
                 target_idx_list.append(data_indices.model.output.name_to_index[output_varname])
                 constraint_idx_list.append(data_indices.model.input.name_to_index[input_constraint_varname])
 
+                # Determine bounds and initial scale for this variable
+                var_bounds = bounds_map.get(output_varname, {}) or {}
+                var_min = float(var_bounds.get("min", default_min))
+                var_max = float(var_bounds.get("max", default_max))
+                assert var_max > var_min, f"Invalid bounds for {output_varname}: min={var_min}, max={var_max}"
+
+                init_scale = float(per_var_scales.get(output_varname, default_scale))
+                # Ensure init_scale within bounds for a valid logit
+                if init_scale <= var_min:
+                    init_scale = var_min + 1e-4
+                if init_scale >= var_max:
+                    init_scale = var_max - 1e-4
+
+                scale_list.append(init_scale)
+                scale_min_list.append(var_min)
+                scale_max_list.append(var_max)
+
+            # # Compute complementary (non-accumulated) indices for outputs and inputs
+            # all_output_indices = list(data_indices.model.output.name_to_index.values())
+
+            # all_input_indices = list(data_indices.model.input.name_to_index.values())
+
+            # prognostic_input_indices = list(data_indices.model.input.prognostic)
+
+            # non_target_idx_list = [idx for idx in all_output_indices if idx not in set(target_idx_list)]
+            # non_constraint_idx_list = [idx for idx in all_input_indices if idx not in set(constraint_idx_list)]
+
+            # Compute unconstrained initial values w0 via logit of normalized scale
+            scale_min_tensor = torch.tensor(scale_min_list, dtype=torch.float32)
+            scale_max_tensor = torch.tensor(scale_max_list, dtype=torch.float32)
+            scale_tensor = torch.tensor(scale_list, dtype=torch.float32)
+            ratio = (scale_tensor - scale_min_tensor) / (scale_max_tensor - scale_min_tensor)
+            ratio = torch.clamp(ratio, 1e-4, 1 - 1e-4)
+            w0 = torch.log(ratio) - torch.log(1 - ratio)
+
             self.map_accum_indices = torch.nn.ParameterDict(
                 {
                     "target_idxs": torch.nn.Parameter(
@@ -427,5 +477,9 @@ class AnemoiModelEncProcDecInterpolator(AnemoiModelEncProcDec):
                         torch.tensor(constraint_idx_list, dtype=torch.long),
                         requires_grad=False,
                     ),
+                    # Learnable per-variable sigmoid-bounded scale parameterization
+                    "scale_unconstrained": torch.nn.Parameter(w0, requires_grad=True),
+                    "scale_min": torch.nn.Parameter(scale_min_tensor, requires_grad=False),
+                    "scale_max": torch.nn.Parameter(scale_max_tensor, requires_grad=False),
                 },
             )
