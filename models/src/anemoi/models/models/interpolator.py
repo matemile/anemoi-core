@@ -655,7 +655,8 @@ class AnemoiModelEncProcDecInterpolator(AnemoiModelEncProcDec):
             # Calculate the accumulation window size
             self.accum_window_size = torch.nn.Parameter(
                 torch.tensor(
-                    data_indices.input_explicit_times[1] - data_indices.input_explicit_times[0] + 1, dtype=torch.long
+                    config.training.explicit_times.input[1] - config.training.explicit_times.input[0] + 1,
+                    dtype=torch.long,
                 ),
                 requires_grad=False,
             )
