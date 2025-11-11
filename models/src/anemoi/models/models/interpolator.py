@@ -52,8 +52,10 @@ class AnemoiModelEncProcDecInterpolator(AnemoiModelEncProcDec):
             Graph definition
         """
         model_config = DotDict(model_config)
-        self.num_target_forcings = (
-            len(model_config.training.target_forcing.data) + model_config.training.target_forcing.time_fraction * 8
+        self.num_target_forcings = len(
+            model_config.training.target_forcing.data
+        ) + model_config.training.target_forcing.time_fraction * getattr(
+            model_config.training.target_forcing, "time_fraction_size", 1
         )
         self.num_input_times = len(model_config.training.explicit_times.input)
         super().__init__(
@@ -135,8 +137,8 @@ class AnemoiModelEncProcDecInterpolator(AnemoiModelEncProcDec):
             x_out[..., self._internal_output_idx] += x_skip[..., self._internal_input_idx]
         if x_skip_accum is not None and self.map_accum_indices is not None:
             x_out[..., self.map_accum_indices["target_idxs"]] += x_skip_accum[
-                ..., self.map_accum_indices["constraint_idxs"] / self.accum_window_size
-            ]
+                ..., self.map_accum_indices["constraint_idxs"]
+            ] / self.accum_window_size
 
         for bounding in self.boundings:
             # bounding performed in the order specified in the config file

@@ -19,7 +19,9 @@ from torch_geometric.data import HeteroData
 
 from anemoi.models.data_indices.collection import IndexCollection
 from anemoi.training.losses import get_loss_function
+from anemoi.training.losses.base import BaseLoss
 from anemoi.training.train.tasks.base import BaseGraphModule
+from anemoi.training.utils.enums import TensorDim
 
 LOGGER = logging.getLogger(__name__)
 
@@ -77,6 +79,7 @@ class GraphInterpolator(BaseGraphModule):
             self.target_forcing_indices = []
 
         self.use_time_fraction = config.training.target_forcing.time_fraction
+        self.time_fraction_size = getattr(config.training.target_forcing, "time_fraction_size", 1)
 
         self.boundary_times = config.training.explicit_times.input
         self.interp_times = config.training.explicit_times.target
@@ -85,15 +88,32 @@ class GraphInterpolator(BaseGraphModule):
 
         self.rollout = 1
 
-        # Auxiliary temporal distribution CE loss (configurable via training.temporal_distribution_loss)
-        td_cfg = getattr(config.model_dump(by_alias=True).training, "temporal_distribution_loss", None)
-        if td_cfg is not None:
-            self.temporal_dist_loss = get_loss_function(
-                config.training.temporal_distribution_loss,
-                scalers=self.scalers,
-                data_indices=self.data_indices,
-            )
-            self.temporal_dist_loss_weight = getattr(config.training, "temporal_distribution_loss_weight", 0.0)
+        # Auxiliary temporal distribution losses (separate CE and rates)
+        self.temporal_ce_loss = None
+        self.temporal_rates_loss = None
+
+        # Mass conservation enforcement mode: 'train' | 'predict' | None
+        self.enforcement = str(getattr(config.training.mass_conservation, "enforcement", None)).lower()
+
+        td_losses = getattr(config.model_dump(by_alias=True).training, "temporal_distribution_losses", None)
+        if td_losses is not None:
+            # CE loss
+            ce_cfg = td_losses.get("cross_entropy", None)
+            if ce_cfg is not None:
+                self.temporal_ce_loss = get_loss_function(
+                    ce_cfg,
+                    scalers=self.scalers,
+                    data_indices=self.data_indices,
+                )
+
+            # Rates loss
+            rates_cfg = config.training.temporal_distribution_losses.get("rates", None)
+            if rates_cfg is not None:
+                self.temporal_rates_loss = get_loss_function(
+                    rates_cfg,
+                    scalers=self.scalers,
+                    data_indices=self.data_indices,
+                )
 
     def _step(
         self,
@@ -109,13 +129,15 @@ class GraphInterpolator(BaseGraphModule):
             ...,
             self.data_indices.data.input.full,
         ]  # (bs, time, ens, latlon, nvar)
+        # Cache for downstream validation metrics post-processing context
+        self._last_x_boundaries = x_bound
 
         num_tfi = len(self.target_forcing_indices)
         target_forcing = torch.empty(
             batch.shape[0],
             batch.shape[2],
             batch.shape[3],
-            num_tfi if not self.use_time_fraction else num_tfi + 8,
+            num_tfi if not self.use_time_fraction else num_tfi + self.time_fraction_size,
             device=self.device,
             dtype=batch.dtype,
         )
@@ -134,7 +156,7 @@ class GraphInterpolator(BaseGraphModule):
             if num_tfi >= 1:
                 target_forcing[..., :num_tfi] = batch[:, self.imap[interp_step], :, :, self.target_forcing_indices]
             if self.use_time_fraction:
-                target_forcing[..., -8:] = (
+                target_forcing[..., -self.time_fraction_size :] = (
                     2 * (interp_step - self.boundary_times[-2]) / (self.boundary_times[-1] - self.boundary_times[-2])
                 ) - 1
 
@@ -159,7 +181,7 @@ class GraphInterpolator(BaseGraphModule):
                 self.data_indices.model.input.prognostic,
             ]
 
-        if self.model.model.map_accum_indices is not None:
+        if self.enforcement == "train":
             # Enforce mass conservation and retrieve temporal distribution in log-space to avoid recomputation
             mass_conservation_result = self.model.model.resolve_mass_conservations(
                 y_preds,
@@ -177,68 +199,121 @@ class GraphInterpolator(BaseGraphModule):
             if not validation_mode:
                 self.check_accum_alignment(y_preds, x_bound)
 
-            # Optional auxiliary temporal distribution CE loss over accumulated variables
-            if self.temporal_dist_loss_weight and self.temporal_dist_loss_weight > 0.0:
-                accum_target_idxs = self.model.model.map_accum_indices["target_idxs"].tolist()
-                accum_constraint_idxs = self.model.model.map_accum_indices["constraint_idxs"].tolist()
+            # Optional auxiliary temporal losses (CE and/or rates) over accumulated variables
+            accum_target_idxs = self.model.model.map_accum_indices["target_idxs"].tolist()
+            accum_constraint_idxs = self.model.model.map_accum_indices["constraint_idxs"].tolist()
 
-                # Predicted distribution over time in log-space (directly from resolve_mass_conservations)
-                constraints = x_bound[:, -1:, ..., accum_constraint_idxs].detach()
-                pred_log_probs = log_weights
+            # Predicted temporal diagnostics
+            constraints = x_bound[:, -1:, ..., accum_constraint_idxs].detach()
+            pred_log_probs = log_weights
 
-                # Target distribution over time from ground-truth sequence
-                # Collect targets for all interpolation times and subset to output vars
-                y_true_seq = torch.stack(
-                    [
-                        batch[:, self.imap[interp_step], :, :, self.data_indices.data.output.full]
-                        for interp_step in self.interp_times
-                    ],
-                    dim=1,
+            # Target sequence over time (fields) subset to accumulated outputs
+            y_true_seq = torch.stack(
+                [
+                    batch[:, self.imap[interp_step], :, :, self.data_indices.data.output.full]
+                    for interp_step in self.interp_times
+                ],
+                dim=1,
+            )
+            target_amounts = y_true_seq[..., accum_target_idxs]
+            target_totals = target_amounts.sum(dim=1, keepdim=True)
+            target_probs = target_amounts / (target_totals.clamp_min(torch.finfo(target_totals.dtype).eps))
+
+            # Validation-only: compute and log temporal entropy for accumulated vars (per variable)
+            if validation_mode:
+                self.log_entropy_on_accumulated_vars(
+                    pred_log_probs=pred_log_probs,
+                    pred_probs=weights,
+                    target_probs=target_probs,
+                    accum_target_idxs=accum_target_idxs,
+                    batch_size=batch.shape[0],
                 )
-                target_amounts = y_true_seq[..., accum_target_idxs]
-                target_totals = target_amounts.sum(dim=1, keepdim=True)
-                target_probs = target_amounts / (target_totals)
 
-                # Validation-only: compute and log temporal entropy for accumulated vars (per variable)
-                if validation_mode:
-                    self.log_entropy_on_accumulated_vars(
-                        pred_log_probs=pred_log_probs,
-                        pred_probs=weights,
-                        target_probs=target_probs,
-                        accum_target_idxs=accum_target_idxs,
-                        batch_size=batch.shape[0],
-                    )
-
-                # Training-only: Log the per-variable softmax scale used for temporal distribution
-                if not validation_mode:
+            # Training-only: Log the per-variable softmax scale used for temporal distribution (logits mode)
+            if not validation_mode and scales is not None:
+                use_rates = self.model.model.map_accum_indices["use_rates"].to(device=scales.device, dtype=torch.bool)
+                ce_mask = ~use_rates
+                if ce_mask.any():
+                    scales_ce = scales[ce_mask] if scales.shape[0] == use_rates.shape[0] else scales
+                    ce_indices = torch.nonzero(ce_mask, as_tuple=False).squeeze(1).tolist()
+                    accum_target_idxs_ce = [accum_target_idxs[i] for i in ce_indices]
                     self.log_softmax_scale_on_accumulated_vars(
-                        scales=scales,
-                        accum_target_idxs=accum_target_idxs,
+                        scales=scales_ce,
+                        accum_target_idxs=accum_target_idxs_ce,
                         batch_size=batch.shape[0],
                     )
 
-                # Mask out tiny/undefined totals in either prediction constraint or target total
-                minimum_total = 0.0
-                zero_constraint = constraints.abs().squeeze(1) > minimum_total  # (bs, ensemble, grid, v_acc)
-                # tiny_tgt = target_totals.abs().squeeze(1) < eps
-                # valid_mask = (~(tiny_pred | tiny_tgt)).to(pred_probs.dtype)
+            # Mask out tiny/undefined totals in either prediction constraint or target total
+            minimum_total = 0.0
+            zero_constraint = constraints.abs().squeeze(1) > minimum_total  # (bs, ensemble, grid, v_acc)
+            valid_mask_all = zero_constraint.to(pred_log_probs.dtype)
 
-                valid_mask = zero_constraint.to(pred_log_probs.dtype)
+            # Split vars by mode
+            try:
+                use_rates = self.model.model.map_accum_indices["use_rates"].to(
+                    device=pred_log_probs.device, dtype=torch.bool,
+                )
+            except Exception:
+                use_rates = torch.zeros((len(accum_target_idxs),), dtype=torch.bool, device=pred_log_probs.device)
 
-                # Compute CE over time; scalers for CE are configured in the loss (grid-level only)
-                ce_loss = self.temporal_dist_loss(
-                    pred_log_probs,
-                    target_probs,
-                    mask=valid_mask,
+            # CE loss on non-rates variables
+            if self.temporal_ce_loss is not None and (~use_rates).any():
+                ce_mask = ~use_rates
+                ce_idx = torch.nonzero(ce_mask, as_tuple=False).squeeze(1).tolist()
+                ce_full_indices = [accum_target_idxs[i] for i in ce_idx]
+                pred_ce = pred_log_probs[..., ce_mask]
+                tgt_ce = target_probs[..., ce_mask]
+                mask_ce = valid_mask_all[..., ce_mask]
+                ce_value = self.temporal_ce_loss(
+                    pred_ce,
+                    tgt_ce,
+                    mask=mask_ce,
                     grid_shard_slice=self.grid_shard_slice,
                     group=self.model_comm_group,
                     inputs_are_log_probs=True,
                     full_variable_size=len(self.data_indices.model.output.full),
-                    target_full_indices=accum_target_idxs,
+                    target_full_indices=ce_full_indices,
                 )
-                metrics.update({"temporal_cross_entropy_loss": ce_loss})
+                metrics.update({"temporal_cross_entropy_loss": ce_value})
+                loss = loss + ce_value
 
-                loss = loss + self.temporal_dist_loss_weight * ce_loss
+            # Rates loss on rates variables
+            if self.temporal_rates_loss is not None and use_rates.any():
+                rates_mask = use_rates
+                rates_idx = torch.nonzero(rates_mask, as_tuple=False).squeeze(1).tolist()
+                rates_full_indices = [accum_target_idxs[i] for i in rates_idx]
+                pred_fields = y_preds[..., accum_target_idxs][..., rates_mask]
+                tgt_fields = target_amounts[..., rates_mask]
+                mask_rates = valid_mask_all[..., rates_mask]
+                rates_value = self.temporal_rates_loss(
+                    pred_fields,
+                    tgt_fields,
+                    mask=mask_rates,
+                    grid_shard_slice=self.grid_shard_slice,
+                    group=self.model_comm_group,
+                    inputs_are_log_probs=False,
+                    full_variable_size=len(self.data_indices.model.output.full),
+                    target_full_indices=rates_full_indices,
+                )
+                metrics.update({"temporal_reconstruction_loss": rates_value})
+                loss = loss + rates_value
+
+                # Optional additional soft-conservation penalty for rates-soft variables
+                try:
+                    use_soft = self.model.model.map_accum_indices["use_soft_conservation"].to(dtype=torch.bool)
+                    soft_lambda = self.model.model.map_accum_indices["soft_penalty_lambda"].to(dtype=y_preds.dtype)
+                    soft_mask = use_rates & use_soft
+                    if torch.any(soft_mask):
+                        sel = [i for i, m in enumerate(accum_target_idxs) if soft_mask[i]]
+                        pred_sum = y_preds[..., sel].sum(dim=1, keepdim=True)
+                        cons = constraints[..., sel]
+                        lam = soft_lambda[soft_mask].view(*(1,) * (pred_sum.ndim - 1), -1)
+                        penalty_tensor = lam * (pred_sum - cons) ** 2
+                        soft_penalty = penalty_tensor.mean()
+                        metrics.update({"temporal_soft_conservation_penalty": soft_penalty})
+                        loss = loss + soft_penalty
+                except Exception:
+                    pass
 
         # During Training and Validation we don't need to compute the loss for the sixth step for non accumulated variables so we skip it
         _inter_step_losses = (
@@ -273,7 +348,7 @@ class GraphInterpolator(BaseGraphModule):
         Logs a per-variable mean signed difference for monitoring during training.
         Returns a boolean indicating whether sums are close to constraints within tolerances.
         """
-        if getattr(self.model.model, "map_accum_indices", None) is None:
+        if self.enforcement is None:
             return True
 
         accum_target_idxs = self.model.model.map_accum_indices["target_idxs"].tolist()
@@ -315,17 +390,19 @@ class GraphInterpolator(BaseGraphModule):
             nonzero_mask = denom != 0
             if torch.any(nonzero_mask):
                 rel_mae_all = (diff[..., j][nonzero_mask] / denom[nonzero_mask]).abs().mean()
+            else:
+                rel_mae_all = torch.zeros((), device=diff.device, dtype=diff.dtype)
 
-                self.log(
-                    f"accum_align_mae_rel_diff_{varname}",
-                    rel_mae_all,
-                    on_epoch=False,
-                    on_step=True,
-                    prog_bar=False,
-                    logger=self.logger_enabled,
-                    batch_size=x_bound.shape[0],
-                    sync_dist=True,
-                )
+            self.log(
+                f"accum_align_mae_rel_diff_{varname}",
+                rel_mae_all,
+                on_epoch=False,
+                on_step=True,
+                prog_bar=False,
+                logger=self.logger_enabled,
+                batch_size=x_bound.shape[0],
+                sync_dist=True,
+            )
 
             # Segmented by constraint threshold
             low_mask = denom <= min_constraint_value
@@ -334,63 +411,71 @@ class GraphInterpolator(BaseGraphModule):
             # Low bucket: absolute difference
             if torch.any(low_mask):
                 diff_mae_low = diff[..., j][low_mask].abs().mean()
+            else:
+                diff_mae_low = torch.zeros((), device=diff.device, dtype=diff.dtype)
 
-                self.log(
-                    f"accum_align_mae_diff_low_{varname}",
-                    diff_mae_low,
-                    on_epoch=False,
-                    on_step=True,
-                    prog_bar=False,
-                    logger=self.logger_enabled,
-                    batch_size=x_bound.shape[0],
-                    sync_dist=True,
-                )
+            self.log(
+                f"accum_align_mae_diff_low_{varname}",
+                diff_mae_low,
+                on_epoch=False,
+                on_step=True,
+                prog_bar=False,
+                logger=self.logger_enabled,
+                batch_size=x_bound.shape[0],
+                sync_dist=True,
+            )
 
             # Low bucket: relative absolute difference (exclude zero denominators)
             low_nonzero_mask = low_mask & nonzero_mask
             if torch.any(low_nonzero_mask):
                 rel_mae_low = (diff[..., j][low_nonzero_mask] / denom[low_nonzero_mask]).abs().mean()
-                self.log(
-                    f"accum_align_mae_rel_diff_low_{varname}",
-                    rel_mae_low,
-                    on_epoch=False,
-                    on_step=True,
-                    prog_bar=False,
-                    logger=self.logger_enabled,
-                    batch_size=x_bound.shape[0],
-                    sync_dist=True,
-                )
+            else:
+                rel_mae_low = torch.zeros((), device=diff.device, dtype=diff.dtype)
+            self.log(
+                f"accum_align_mae_rel_diff_low_{varname}",
+                rel_mae_low,
+                on_epoch=False,
+                on_step=True,
+                prog_bar=False,
+                logger=self.logger_enabled,
+                batch_size=x_bound.shape[0],
+                sync_dist=True,
+            )
 
             # High bucket: absolute difference
             if torch.any(high_mask):
                 diff_mae_high = diff[..., j][high_mask].abs().mean()
+            else:
+                diff_mae_high = torch.zeros((), device=diff.device, dtype=diff.dtype)
 
-                self.log(
-                    f"accum_align_mae_diff_high_{varname}",
-                    diff_mae_high,
-                    on_epoch=False,
-                    on_step=True,
-                    prog_bar=False,
-                    logger=self.logger_enabled,
-                    batch_size=x_bound.shape[0],
-                    sync_dist=True,
-                )
+            self.log(
+                f"accum_align_mae_diff_high_{varname}",
+                diff_mae_high,
+                on_epoch=False,
+                on_step=True,
+                prog_bar=False,
+                logger=self.logger_enabled,
+                batch_size=x_bound.shape[0],
+                sync_dist=True,
+            )
 
             # High bucket: relative absolute difference (exclude zero denominators)
             high_nonzero_mask = high_mask & nonzero_mask
             if torch.any(high_nonzero_mask):
                 rel_mae_high = (diff[..., j][high_nonzero_mask] / denom[high_nonzero_mask]).abs().mean()
+            else:
+                rel_mae_high = torch.zeros((), device=diff.device, dtype=diff.dtype)
 
-                self.log(
-                    f"accum_align_mae_rel_diff_high_{varname}",
-                    rel_mae_high,
-                    on_epoch=False,
-                    on_step=True,
-                    prog_bar=False,
-                    logger=self.logger_enabled,
-                    batch_size=x_bound.shape[0],
-                    sync_dist=True,
-                )
+            self.log(
+                f"accum_align_mae_rel_diff_high_{varname}",
+                rel_mae_high,
+                on_epoch=False,
+                on_step=True,
+                prog_bar=False,
+                logger=self.logger_enabled,
+                batch_size=x_bound.shape[0],
+                sync_dist=True,
+            )
 
         # Return a simple closeness check as a health indicator
         # return torch.allclose(pred_sum, constraints, rtol=1e-4, atol=1e-5)
@@ -483,7 +568,7 @@ class GraphInterpolator(BaseGraphModule):
         Uses scaler_indices to restrict the training loss to non-accumulated variables.
         Falls back to the default implementation if no accumulation mapping is set.
         """
-        if getattr(self.model.model, "map_accum_indices", None) is not None:
+        if self.enforcement == "train":
             # non_accum_idxs = self.model.model.map_accum_indices["non_target_idxs"].tolist()
             prognostic_idxs = self.data_indices.model.output.prognostic.tolist()
             return self.loss(
@@ -503,3 +588,64 @@ class GraphInterpolator(BaseGraphModule):
             model_comm_group=self.model_comm_group,
             grid_shard_shapes=self.grid_shard_shapes,
         )
+
+    def calculate_val_metrics(
+        self,
+        y_pred: torch.Tensor,
+        y: torch.Tensor,
+        rollout_step: int = 0,
+        grid_shard_slice: slice | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Calculate metrics on the validation output (post-processed, real-space where applicable)
+
+        Parameters
+        ----------
+        y_pred: torch.Tensor
+            Predicted ensemble
+        y: torch.Tensor
+            Ground truth (target).
+        rollout_step: int
+            Rollout step
+
+        Returns
+        -------
+        val_metrics : dict[str, torch.Tensor]
+            validation metrics and predictions.
+        """
+        metrics = {}
+        y_postprocessed = self.model.post_processors(y, in_place=False)
+
+        # Provide boundaries context if available; processor will no-op if not needed
+        if hasattr(self, "_last_x_boundaries") and self._last_x_boundaries is not None:
+            y_pred_postprocessed = self.model.post_processors(
+                y_pred,
+                in_place=False,
+                x_boundaries_normalized=self._last_x_boundaries,
+            )
+        else:
+            y_pred_postprocessed = self.model.post_processors(y_pred, in_place=False)
+
+        for metric_name, metric in self.metrics.items():
+            if not isinstance(metric, BaseLoss):
+                # If not a loss, we cannot feature scale, so call normally
+                metrics[f"{metric_name}_metric/{rollout_step + 1}"] = metric(y_pred_postprocessed, y_postprocessed)
+                continue
+
+            for mkey, indices in self.val_metric_ranges.items():
+                metric_step_name = f"{metric_name}_metric/{mkey}/{rollout_step + 1}"
+                if len(metric.scaler.subset_by_dim(TensorDim.VARIABLE.value)):
+                    exception_msg = (
+                        "Validation metrics cannot be scaled over the variable dimension"
+                        " in the post processed space."
+                    )
+                    raise ValueError(exception_msg)
+
+                metrics[metric_step_name] = metric(
+                    y_pred_postprocessed,
+                    y_postprocessed,
+                    scaler_indices=[..., indices],
+                    grid_shard_slice=grid_shard_slice,
+                    group=self.model_comm_group,
+                )
+
+        return metrics
