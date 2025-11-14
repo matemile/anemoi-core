@@ -17,6 +17,7 @@ import torch
 from anemoi.models.data_indices.collection import IndexCollection
 from anemoi.models.layers.activations import CustomRelu
 from anemoi.models.preprocessing import BasePreprocessor
+from anemoi.models.preprocessing.normalizer import InputNormalizer
 
 LOGGER = logging.getLogger(__name__)
 
@@ -106,7 +107,7 @@ class Postprocessor(BasePreprocessor):
         LOGGER.info(f"Postprocessor: applying {method} to {name}")
         return postprocessor_function
 
-    def inverse_transform(self, x: torch.Tensor, in_place: bool = True) -> torch.Tensor:
+    def inverse_transform(self, x: torch.Tensor, in_place: bool = True, **kwargs) -> torch.Tensor:
         """Postprocess model output tensor."""
         if not in_place:
             x = x.clone()
@@ -251,7 +252,7 @@ class ConditionalPostprocessor(Postprocessor):
         """
         pass
 
-    def inverse_transform(self, x: torch.Tensor, in_place: bool = True) -> torch.Tensor:
+    def inverse_transform(self, x: torch.Tensor, in_place: bool = True, **kwargs) -> torch.Tensor:
         """Set values in the output tensor."""
         if not in_place:
             x = x.clone()
@@ -339,3 +340,157 @@ class ConditionalNaNPostprocessor(ConditionalPostprocessor):
         """Get NaN mask from data"""
         # reference/masking variable is already selected. Mask covers all remaining dimensions.
         return torch.isnan(x)
+
+
+class TemporalRescaleByTotals(BasePreprocessor):
+    """Rescale accumulated output time series in REAL space to match right-boundary totals.
+
+    This is an inverse-only post-processor. It expects the caller to pass the real-space
+    boundary tensor via keyword argument `x_boundaries_real` or `x_boundaries_normalized` and operates only on tensors
+    whose last dimension matches the model output size.
+
+    Config expected fields (all optional with defaults):
+      - enabled: bool (default: True)
+      - enforcement: str (default: "predict"); only active if equals "predict"
+      - mapping: dict[target_var -> constraint_var]; typically `${training.mass_conservation.accumulations}`
+      - minimum_abs_total: float (default 0.0)
+      - minimum_abs_pred_sum: float (default 1e-6)
+    """
+
+    def __init__(
+        self,
+        config=None,
+        data_indices: Optional[IndexCollection] = None,
+        statistics: Optional[dict] = None,
+    ) -> None:
+        # Keep a direct handle to statistics for optional de-normalization when receiving normalized inputs
+        self.statistics = statistics
+        self.config = config
+        super().__init__({}, data_indices, statistics)
+
+        # Initialize a matching InputNormalizer to reuse inverse_transform for selective de-normalization
+        self._input_normalizer: InputNormalizer | None = None
+        try:
+            cfg = self.data_indices.config
+            normalizer_cfg = None
+            if isinstance(cfg, dict):
+                if "normalizer" in cfg:
+                    normalizer_cfg = cfg["normalizer"]
+                elif "data" in cfg and isinstance(cfg["data"], dict) and "normalizer" in cfg["data"]:
+                    normalizer_cfg = cfg["data"]["normalizer"]
+            if normalizer_cfg is not None:
+                self._input_normalizer = InputNormalizer(
+                    config=normalizer_cfg,
+                    data_indices=self.data_indices,
+                    statistics=self.statistics,
+                )
+        except Exception as e:
+            LOGGER.warning(f"TemporalRescaleByTotals: could not initialize InputNormalizer for denorm: {e}")
+            raise e
+
+        # Flags and thresholds
+        self.enabled = bool(getattr(config, "enabled", True)) if config is not None else True
+        self.enforcement = str(getattr(config, "enforcement", "predict")).lower() if config is not None else "predict"
+        self.minimum_abs_total = float(getattr(config, "minimum_abs_total", 0.0)) if config is not None else 0.0
+        self.minimum_abs_pred_sum = (
+            float(getattr(config, "minimum_abs_pred_sum", 1.0e-6)) if config is not None else 1.0e-6
+        )
+
+        # Build aligned index lists from mapping dict[target -> constraint]
+        mapping = getattr(config, "mapping", {}) if config is not None else {}
+        if isinstance(mapping, dict):
+            targets = list(mapping.keys())
+            constraints = [mapping[t] for t in targets]
+        else:
+            targets, constraints = [], []
+
+        self._target_indices = []
+        self._constraint_indices = []
+        self._target_names: list[str] = []
+        self._constraint_names: list[str] = []
+
+        name_to_output = self.data_indices.model.output.name_to_index
+        name_to_input = self.data_indices.model.input.name_to_index
+
+        for t_name, c_name in zip(targets, constraints):
+            if t_name in name_to_output and c_name in name_to_input:
+                self._target_indices.append(name_to_output[t_name])
+                self._constraint_indices.append(name_to_input[c_name])
+                self._target_names.append(t_name)
+                self._constraint_names.append(c_name)
+            else:
+                LOGGER.warning(
+                    f"TemporalRescaleByTotals: skipping mapping {t_name}->{c_name} (indices not found in model indices)."
+                )
+
+        # Cache sizes for quick guards
+        self._num_output_vars = len(name_to_output)
+        self._num_input_vars = len(name_to_input)
+
+    def inverse_transform(self, x: torch.Tensor, in_place: bool = True, **kwargs) -> torch.Tensor:
+        if not in_place:
+            x = x.clone()
+
+        # Quick guards
+        if not self.enabled:
+            return x
+        if self.enforcement != "predict":
+            return x
+        if x.ndim < 2 or x.shape[-1] != self._num_output_vars:
+            # Only operate on tensors shaped like model outputs
+            return x
+
+        # Determine boundaries context: prefer real if provided, else try normalized and denormalize
+        x_boundaries_real: Optional[torch.Tensor] = kwargs.get("x_boundaries_real", None)
+        x_boundaries_normalized: Optional[torch.Tensor] = kwargs.get("x_boundaries_normalized", None)
+
+        if x_boundaries_real is None and x_boundaries_normalized is not None:
+            # Denormalize normalized boundaries in-place to obtain real-space totals for constraints
+            # Only denormalize the constraint channels we need, using data (training) input statistics
+            # Shapes: x_boundaries_normalized[..., C], C = full model input vars; select constraint_idx later
+            # We reconstruct real-space slice for constraints below directly
+            pass
+        elif x_boundaries_real is None and x_boundaries_normalized is None:
+            # No context provided -> no-op
+            return x
+
+        if not self._target_indices:
+            # Nothing to rescale
+            return x
+
+        device = x.device
+        dtype = x.dtype
+
+        target_idx = torch.tensor(self._target_indices, device=device, dtype=torch.long)
+        constraint_idx = torch.tensor(self._constraint_indices, device=device, dtype=torch.long)
+
+        if x_boundaries_real is None:
+            # We have normalized boundaries; denormalize constraints slice to real space
+            constraints_norm = x_boundaries_normalized[:, -1:, ..., constraint_idx]
+            # Prefer using the InputNormalizer for selective inverse_transform (std-only per config)
+
+            train_name_to_input = self.data_indices.data.input.name_to_index
+            train_constraint_indices = torch.tensor(
+                [train_name_to_input[name] for name in self._constraint_names], device=device, dtype=torch.long
+            )
+            constraints = self._input_normalizer.inverse_transform(
+                constraints_norm, in_place=False, data_index=train_constraint_indices
+            )
+
+        else:
+            # Use provided real-space boundaries directly
+            constraints = x_boundaries_real[:, -1:, ..., constraint_idx]
+        # Predicted sums over time (REAL space, since this runs after denorm): (B, 1, E, G, V_acc)
+        pred_sum = x[..., target_idx].sum(dim=1, keepdim=True)
+
+        # Compute scaling factors with numerical guards (abs-based as configured elsewhere)
+        alpha = constraints.abs() / pred_sum.abs().clamp_min(self.minimum_abs_pred_sum)
+        if self.minimum_abs_total > 0.0:
+            skip_mask = constraints.abs() <= self.minimum_abs_total
+            alpha = torch.where(skip_mask, torch.ones_like(alpha, dtype=dtype, device=device), alpha)
+
+        # Apply broadcast multiply across time
+        x_scaled = x[..., target_idx] * alpha.to(dtype=dtype, device=device)
+        x[..., target_idx] = x_scaled
+
+        return x

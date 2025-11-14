@@ -156,9 +156,13 @@ class GraphInterpolator(BaseGraphModule):
             if num_tfi >= 1:
                 target_forcing[..., :num_tfi] = batch[:, self.imap[interp_step], :, :, self.target_forcing_indices]
             if self.use_time_fraction:
-                target_forcing[..., -self.time_fraction_size :] = (
-                    2 * (interp_step - self.boundary_times[-2]) / (self.boundary_times[-1] - self.boundary_times[-2])
-                ) - 1
+                # target_forcing[..., -self.time_fraction_size :] = (
+                #     2 * (interp_step - self.boundary_times[-2]) / (self.boundary_times[-1] - self.boundary_times[-2])
+                # ) - 1
+
+                target_forcing[..., -self.time_fraction_size :] = self.model.model.target_forcing(
+                    interp_step, self.boundary_times[-2], self.boundary_times[-1],
+                )
 
             y_pred = self(x_bound, target_forcing)
             y_preds[:, idx] = y_pred
@@ -166,14 +170,10 @@ class GraphInterpolator(BaseGraphModule):
         # If the last interpolation time is a boundary time, copy boundary values to the last step
         # for the NON-accumulated variables (complement of the accumulated mapping)
         # NOTE: Currently this method does not support the existence of any diagnostic variables - because they would have to also be predicted at the last step - but here we assume that only prognostic variables need to have their predicted values replaced with the actual boundary values
-        if (
-            self.interp_times[-1] in self.boundary_times
-            and getattr(self.model.model, "map_accum_indices", None) is not None
-        ):
-            # non_accum_out = self.model.model.map_accum_indices["non_target_idxs"].tolist()
-            # non_accum_in = self.model.model.map_accum_indices["non_constraint_idxs"].tolist()
-            # y_preds[:, -1, ..., non_accum_out] = x_bound[:, -1, ..., non_accum_in]
+        flag_outp_includes_right_boundary = self.interp_times[-1] in self.boundary_times
+        if flag_outp_includes_right_boundary and getattr(self.model.model, "map_accum_indices", None) is not None:
 
+            # Overriding the predicted last step with the true values at the the boundary for the prognostic variables
             y_preds[:, -1, ..., self.data_indices.model.output.prognostic] = x_bound[
                 :,
                 -1,
@@ -251,7 +251,8 @@ class GraphInterpolator(BaseGraphModule):
             # Split vars by mode
             try:
                 use_rates = self.model.model.map_accum_indices["use_rates"].to(
-                    device=pred_log_probs.device, dtype=torch.bool,
+                    device=pred_log_probs.device,
+                    dtype=torch.bool,
                 )
             except Exception:
                 use_rates = torch.zeros((len(accum_target_idxs),), dtype=torch.bool, device=pred_log_probs.device)

@@ -19,17 +19,17 @@ from anemoi.training.losses.base import BaseLoss
 LOGGER = logging.getLogger(__name__)
 
 
-class TemporalDistributionCrossEntropyLoss(BaseLoss):
-    """Cross-entropy over the time dimension for accumulated variables, with optional ratio-focal weighting
-    (gamma) and shift-tolerant temporal alignment.
+class TemporalDistributionLoss(BaseLoss):
+    """Temporal loss over sub-steps with optional shift alignment.
 
-    - Inputs are distributions over the time axis (sum along time = 1) or their log-probabilities.
-    - Optionally applies focal loss modulation with gamma (and alpha) to emphasize sharp events.
-    - Optionally performs small-window temporal shift alignment for a subset of variables
-      (e.g., tp, cp, sf), aggregating the cross-entropy across shifts via min/softmin/mean.
+    Modes:
+    - "ce": Cross-entropy over the time dimension for normalized temporal distributions
+      (inputs are probabilities or log-probabilities), with optional shift-tolerant alignment.
+    - "rates": Reconstruction loss (MAE/MSE/Huber) between predicted and target substep fields
+      (inputs are physical fields, not probabilities). Supports shift-tolerant alignment.
 
-    The loss reduces the time axis internally and returns a per-variable tensor with
-    shape (bs, ensemble, grid, n_vars), to which standard scalers and reduction apply.
+    The loss reduces the time axis internally (summing over time) and returns a per-variable tensor
+    with shape (bs, ensemble, grid, n_vars), to which standard scalers and reduction apply.
     """
 
     name: str = "temporal_distribution_ce"
@@ -38,19 +38,23 @@ class TemporalDistributionCrossEntropyLoss(BaseLoss):
         self,
         *,
         ignore_nans: bool = False,
-        # Focal loss params
-        focal_gamma: float = 0.0,
-        focal_gamma_per_var: dict | None = None,
+        # Mode: "ce" or "rates"
+        mode: str = "ce",
+        # Reconstruction loss for rates mode: "mae" | "mse" | "huber"
+        reconstruction: str = "mae",
+        huber_delta: float = 1.0,
         # Shift-tolerant alignment params
         shift_alignment: dict | None = None,
+        # Optionally scale per-sample loss by the sample size (sum over time of target)
+        scale_by_sample_size: bool = False,
     ) -> None:
         super().__init__(ignore_nans=ignore_nans)
 
-        # Focal
-        self.focal_gamma: float = float(focal_gamma) if focal_gamma is not None else 0.0
-        self.focal_gamma_per_var: dict[str, float] = (
-            {str(k): float(v) for k, v in focal_gamma_per_var.items()} if focal_gamma_per_var else {}
-        )
+        # Mode and reconstruction configuration
+        self.mode: str = str(mode).lower()
+        self.reconstruction: str = str(reconstruction).lower()
+        self.huber_delta: float = float(huber_delta)
+        self.scale_by_sample_size: bool = bool(scale_by_sample_size)
 
         # Shift alignment configuration
         shift_cfg = shift_alignment or {}
@@ -66,9 +70,9 @@ class TemporalDistributionCrossEntropyLoss(BaseLoss):
         self.shift_beta: float = float(shift_cfg.get("beta", 5.0))
         self.shift_renormalize: bool = bool(shift_cfg.get("renormalize", True))
         # Coverage-weighted conditional CE over overlap bins (Variant B)
-        self.shift_coverage_weighted_conditional: bool = bool(
-            shift_cfg.get("coverage_weighted_conditional", False)
-        )
+        self.shift_coverage_weighted_conditional: bool = bool(shift_cfg.get("coverage_weighted_conditional", False))
+        # Rates normalization strategy over overlap: 'sum' | 'mean' | 'mass_mean'
+        self.shift_rates_normalization: str = str(shift_cfg.get("rates_normalization", "sum")).lower()
         # Variables (by output names) to which shift alignment applies
         self.shift_variable_names: list[str] = list(shift_cfg.get("variables", []))
 
@@ -85,6 +89,33 @@ class TemporalDistributionCrossEntropyLoss(BaseLoss):
             self._output_name_to_full_idx = None
             self._output_idx_to_name = None
 
+    def _build_overlap_mask(self, T: int, delta: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        mask_1d = torch.ones((T,), device=device, dtype=dtype)
+        if delta > 0:
+            mask_1d[:delta] = 0.0
+        elif delta < 0:
+            d = -delta
+            mask_1d[T - d :] = 0.0
+        return mask_1d.view(1, T, 1, 1, 1)
+
+    def _aggregate_shifts(self, stack: torch.Tensor) -> torch.Tensor:
+        if self.shift_aggregation == "min":
+            return stack.min(dim=0).values
+        if self.shift_aggregation == "mean":
+            return stack.mean(dim=0)
+        beta = max(self.shift_beta, 1e-6)
+        return -(1.0 / beta) * (torch.logsumexp(-beta * stack, dim=0) - log(stack.shape[0]))
+
+    def _compute_temporal_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        inputs_are_log_probs: bool,
+        shift_rel_indices: list[int],
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
     def forward(
         self,
         pred_probs: torch.Tensor,
@@ -100,214 +131,266 @@ class TemporalDistributionCrossEntropyLoss(BaseLoss):
         full_variable_size: int | None = None,
         target_full_indices: list[int] | torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Compute cross-entropy over time and apply scaling and reduction.
+        """Compute temporal loss (CE or reconstruction) with optional shift alignment.
 
         Parameters
         ----------
         pred_probs : torch.Tensor
-            Predicted distributions over time, shape (bs, time, ensemble, grid, n_vars)
-            or any permutation which will be rearranged internally.
+            For mode=="ce": predicted distributions or log-distributions across time.
+            For mode=="rates": predicted sub-step fields in physical units.
+            Shape (bs, time, ensemble, grid, n_vars)
         target_probs : torch.Tensor
-            Target distributions over time (sum over time == 1), same shape as pred_probs.
-        mask : torch.Tensor | None, optional
-            Optional mask with shape (bs, ensemble, grid, n_vars) to zero out contributions
-            for positions where the total mass is tiny or undefined.
-        squash : bool, optional
-            Average last dimension during reduction, by default True
-        scaler_indices : tuple[int, ...] | None, optional
-            Indices to subset the scaler application, by default None
-        without_scalers : list[str] | list[int] | None, optional
-            Scalers to exclude, by default None
-        grid_shard_slice : slice | None, optional
-            Grid shard slice for distributed training, by default None
-        group : ProcessGroup | None, optional
-            Distributed group to reduce over, by default None
+            For mode=="ce": target distributions across time (sum over time == 1).
+            For mode=="rates": target sub-step fields.
+            Same shape as pred_probs.
+        mask : torch.Tensor | None
+            Optional mask with shape (bs, ensemble, grid, n_vars) applied after time reduction.
         """
-
         # Ensure shape (bs, time, ensemble, grid, vars)
-        assert pred_probs.ndim == 5 and target_probs.ndim == 5, (
-            f"Expected 5D tensors (bs, time, ensemble, grid, vars); got {pred_probs.shape} and {target_probs.shape}"
+        assert (
+            pred_probs.ndim == 5 and target_probs.ndim == 5
+        ), f"Expected 5D tensors (bs, time, ensemble, grid, vars); got {pred_probs.shape} and {target_probs.shape}"
+
+        # Map which variables should get shift alignment (by relative indices of incoming V-subset)
+        desired_full_idxs: set[int] = set()
+        if self._output_name_to_full_idx is not None and len(self.shift_variable_names) > 0:
+            for n in self.shift_variable_names:
+                if n in self._output_name_to_full_idx:
+                    desired_full_idxs.add(self._output_name_to_full_idx[n])
+
+        rel_map: dict[int, int] = {}
+        if target_full_indices is not None and len(desired_full_idxs) > 0:
+            if isinstance(target_full_indices, torch.Tensor):
+                tf_idx = target_full_indices.detach().cpu().tolist()
+            else:
+                tf_idx = list(target_full_indices)
+            rel_map = {full_idx: pos for pos, full_idx in enumerate(tf_idx) if full_idx in desired_full_idxs}
+        shift_rel_indices: list[int] = list(rel_map.values())
+
+        loss_per_entity = self._compute_temporal_loss(
+            pred_probs,
+            target_probs,
+            inputs_are_log_probs=inputs_are_log_probs,
+            shift_rel_indices=shift_rel_indices,
         )
 
-        # Time dimension is at dim=1; we reduce along it below
-
-        # Numerics
-        eps = torch.finfo(pred_probs.dtype).eps
-
-        # Get probabilities and log-probabilities
-        if inputs_are_log_probs:
-            log_pred = pred_probs
-            prob_pred = log_pred.exp()
-        else:
-            prob_pred = pred_probs
-            log_pred = (prob_pred + eps).log()
-
-        # Helper: focal factor
-        V = pred_probs.shape[-1]
-
-        # Build per-variable gamma/alpha aligned to incoming variable subset using full indices -> names
-        if target_full_indices is not None and self._output_idx_to_name is not None:
-            if isinstance(target_full_indices, torch.Tensor):
-                tf_idx_list = target_full_indices.detach().cpu().tolist()
-            else:
-                tf_idx_list = list(target_full_indices)
-        else:
-            tf_idx_list = [None] * V
-
-        gamma_values: list[float] = []
-
-        for j in range(V):
-            full_idx = tf_idx_list[j] if j < len(tf_idx_list) else None
-            name = (
-                self._output_idx_to_name.get(full_idx)
-                if (self._output_idx_to_name is not None and full_idx is not None)
-                else None
-            )
-
-            g = self.focal_gamma
-            if name is not None and name in self.focal_gamma_per_var:
-                g = float(self.focal_gamma_per_var[name])
-            gamma_values.append(g)
-
-        gamma_v = pred_probs.new_tensor(gamma_values)  # (V,)
-
-        def ce_over_time(
-            p: torch.Tensor, log_p: torch.Tensor, y: torch.Tensor, gamma_vec: torch.Tensor
-        ) -> torch.Tensor:
-            # p, log_p, y shapes: (B, T, E, G, V)
-            gamma_b = gamma_vec.view(*(1,) * (p.ndim - 1), -1)  # (1,1,1,1,V)
-            # Ratio focal modulation: ((y+eps)/(p+eps))^gamma
-            # When gamma == 0, the modulation is 1 (no focal effect)
-            ratio = (y + eps) / (p + eps)
-            mod = ratio.pow(gamma_b)
-            term = -y * mod * log_p
-            return term.sum(dim=1)  # (B, E, G, V)
-
-        # Base CE (no shift alignment)
-        ce_base = ce_over_time(prob_pred, log_pred, target_probs, gamma_v)
-
-        # If shift alignment disabled or no variables specified, use base CE
-        if not self.shift_enabled or (self.shift_variable_names is not None and len(self.shift_variable_names) == 0):
-            ce_per_entity = ce_base
-        else:
-            # Map desired shift variables (by full output index) to relative indices in the incoming V-subset
-            desired_full_idxs: set[int] = set()
-            if self._output_name_to_full_idx is not None and len(self.shift_variable_names) > 0:
-                for n in self.shift_variable_names:
-                    if n in self._output_name_to_full_idx:
-                        desired_full_idxs.add(self._output_name_to_full_idx[n])
-
-            rel_map: dict[int, int] = {}
-            if target_full_indices is not None and len(desired_full_idxs) > 0:
-                if isinstance(target_full_indices, torch.Tensor):
-                    tf_idx = target_full_indices.detach().cpu().tolist()
-                else:
-                    tf_idx = list(target_full_indices)
-                rel_map = {full_idx: pos for pos, full_idx in enumerate(tf_idx) if full_idx in desired_full_idxs}
-
-            shift_rel_indices: list[int] = list(rel_map.values())
-
-            if len(shift_rel_indices) == 0:
-                # None of the requested variables are in this subset; fall back to base
-                ce_per_entity = ce_base
-            else:
-                # Compute CE for each temporal shift
-                T = prob_pred.shape[1]
-                ce_shifts: list[torch.Tensor] = []
-                for delta in self.shift_values:
-                    if delta == 0:
-                        p_shift = prob_pred
-                    elif delta > 0:
-                        # shift right by delta (later in time); zero-pad at start
-                        p_shift = torch.zeros_like(prob_pred)
-                        p_shift[:, delta:, ...] = prob_pred[:, : T - delta, ...]
-                    else:  # delta < 0, shift left; zero-pad at end
-                        d = -delta
-                        p_shift = torch.zeros_like(prob_pred)
-                        p_shift[:, : T - d, ...] = prob_pred[:, d:, ...]
-
-                    if self.shift_coverage_weighted_conditional:
-                        # Mask for overlap bins only (drop shifted-out edges)
-                        mask_1d = p_shift.new_ones((T,))
-                        if delta > 0:
-                            mask_1d[:delta] = 0.0
-                        elif delta < 0:
-                            d = -delta
-                            mask_1d[T - d :] = 0.0
-                        overlap_mask = mask_1d.view(1, T, 1, 1, 1)  # broadcastable
-
-                        y_masked = target_probs * overlap_mask
-                        p_masked = p_shift * overlap_mask
-
-                        # Coverage of target on overlap; renormalize both on overlap
-                        cy = y_masked.sum(dim=1, keepdim=True).clamp_min(eps)  # (B,1,E,G,V)
-                        cp = p_masked.sum(dim=1, keepdim=True).clamp_min(eps)
-
-                        y_hat = y_masked / cy
-                        p_hat = p_masked / cp
-                        log_p_hat = (p_hat + eps).log()
-
-                        # Conditional CE on overlap with ratio-focal modulation
-                        ce_cond = ce_over_time(p_hat, log_p_hat, y_hat, gamma_v)  # (B,E,G,V)
-                        # Coverage-weighted conditional CE
-                        ce_cov = cy.squeeze(1) * ce_cond  # (B,E,G,V)
-                        ce_shifts.append(ce_cov)
-                    else:
-                        # Original behavior: renormalize across full window after zero-padding
-                        if self.shift_renormalize:
-                            denom = p_shift.sum(dim=1, keepdim=True).clamp_min(eps)
-                            p_shift = p_shift / denom
-
-                        log_p_shift = (p_shift + eps).log()
-                        ce_shift = ce_over_time(p_shift, log_p_shift, target_probs, gamma_v)  # (B,E,G,V)
-                        ce_shifts.append(ce_shift)
-
-                # Stack over shifts
-                ce_stack = torch.stack(ce_shifts, dim=0)  # (S,B,E,G,V)
-
-                # Aggregate across shifts per variable
-                if self.shift_aggregation == "min":
-                    ce_agg = ce_stack.min(dim=0).values
-                elif self.shift_aggregation == "mean":
-                    ce_agg = ce_stack.mean(dim=0)
-                else:
-                    # softmin with temperature beta
-                    beta = max(self.shift_beta, 1e-6)
-                    # softmin(x) = -1/beta * log( (1/S) * sum exp(-beta * x) )
-                    ce_agg = - (1.0 / beta) * (
-                        torch.logsumexp(-beta * ce_stack, dim=0) - log(ce_stack.shape[0])
-                    )
-
-                # Compose final CE: use aggregated values for selected vars, base CE for the rest
-                ce_per_entity = ce_base.clone()
-                ce_per_entity[..., shift_rel_indices] = ce_agg[..., shift_rel_indices]
-
         if mask is not None:
-            # Expect mask shape (bs, ensemble, grid, vars)
-            ce_per_entity = ce_per_entity * mask
+            loss_per_entity = loss_per_entity * mask
 
-        # Optionally expand to full variable dimension so variable-wise scalers
-        # defined over all outputs (e.g., accumulated_variable) can be applied.
+        # Optional magnitude-aware scaling by sample size (sum over time of target)
+        if self.scale_by_sample_size:
+            sample_size = target_probs.sum(dim=1)
+            loss_per_entity = loss_per_entity * sample_size
+
         if full_variable_size is not None and target_full_indices is not None:
             if isinstance(target_full_indices, torch.Tensor):
-                idx = target_full_indices.to(device=ce_per_entity.device)
+                idx = target_full_indices.to(device=loss_per_entity.device)
             else:
-                idx = torch.tensor(target_full_indices, device=ce_per_entity.device)
-            ce_full = ce_per_entity.new_zeros((*ce_per_entity.shape[:-1], full_variable_size))
-            ce_full.index_copy_(-1, idx, ce_per_entity)
-            ce = ce_full
+                idx = torch.tensor(target_full_indices, device=loss_per_entity.device)
+            loss_full = loss_per_entity.new_zeros((*loss_per_entity.shape[:-1], full_variable_size))
+            loss_full.index_copy_(-1, idx, loss_per_entity)
+            loss_tensor = loss_full
         else:
-            ce = ce_per_entity
+            loss_tensor = loss_per_entity
 
-        # Apply scalers (variable/grid) and reduce as in other BaseLoss losses
-        ce = self.scale(
-            ce,
+        loss_tensor = self.scale(
+            loss_tensor,
             scaler_indices,
             without_scalers=without_scalers,
             grid_shard_slice=grid_shard_slice,
         )
 
         is_sharded = grid_shard_slice is not None
-        return self.reduce(ce, squash=squash, group=group if is_sharded else None)
+        return self.reduce(loss_tensor, squash=squash, group=group if is_sharded else None)
 
 
+class TemporalDistributionCrossEntropyLoss(TemporalDistributionLoss):
+    """Cross-entropy over the time dimension for accumulated variables with optional shift alignment.
+
+    This is a thin wrapper around TemporalDistributionLoss with mode fixed to "ce".
+    """
+
+    name: str = "temporal_distribution_ce"
+
+    def __init__(
+        self,
+        *,
+        ignore_nans: bool = False,
+        shift_alignment: dict | None = None,
+        scale_by_sample_size: bool = False,
+    ) -> None:
+        super().__init__(
+            ignore_nans=ignore_nans,
+            mode="ce",
+            reconstruction="mae",
+            huber_delta=1.0,
+            shift_alignment=shift_alignment,
+            scale_by_sample_size=scale_by_sample_size,
+        )
+
+    def _compute_temporal_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        inputs_are_log_probs: bool,
+        shift_rel_indices: list[int],
+    ) -> torch.Tensor:
+        eps = torch.finfo(pred.dtype).eps
+        if inputs_are_log_probs:
+            log_pred = pred
+            prob_pred = log_pred.exp()
+        else:
+            prob_pred = pred
+            log_pred = (prob_pred + eps).log()
+
+        def ce_over_time(p: torch.Tensor, log_p: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            term = -y * log_p
+            return term.sum(dim=1)
+
+        ce_base = ce_over_time(prob_pred, log_pred, target)
+        if not self.shift_enabled or len(shift_rel_indices) == 0:
+            return ce_base
+
+        T = prob_pred.shape[1]
+        ce_shifts: list[torch.Tensor] = []
+        for delta in self.shift_values:
+            if delta == 0:
+                p_shift = prob_pred
+            elif delta > 0:
+                p_shift = torch.zeros_like(prob_pred)
+                p_shift[:, delta:, ...] = prob_pred[:, : T - delta, ...]
+            else:
+                d = -delta
+                p_shift = torch.zeros_like(prob_pred)
+                p_shift[:, : T - d, ...] = prob_pred[:, d:, ...]
+
+            overlap_mask = self._build_overlap_mask(T, delta, prob_pred.device, prob_pred.dtype)
+            y_masked = target * overlap_mask
+            if self.shift_coverage_weighted_conditional:
+                p_masked = p_shift * overlap_mask
+                cy_unclamped = y_masked.sum(dim=1, keepdim=True)
+                cy = cy_unclamped.clamp_min(eps)
+                cp = p_masked.sum(dim=1, keepdim=True).clamp_min(eps)
+                y_hat = y_masked / cy
+                p_hat = p_masked / cp
+                log_p_hat = (p_hat + eps).log()
+                ce_cond = ce_over_time(p_hat, log_p_hat, y_hat)
+                ce_shifts.append(cy_unclamped.squeeze(1) * ce_cond)
+            else:
+                # Partial CE over overlap: -sum_{overlap} y_t log p_t
+                log_p_full = log_pred
+                ce_shift = -(y_masked * log_p_full).sum(dim=1)
+                ce_shifts.append(ce_shift)
+
+        ce_agg = self._aggregate_shifts(torch.stack(ce_shifts, dim=0))
+        ce_per_entity = ce_base.clone()
+        ce_per_entity[..., shift_rel_indices] = ce_agg[..., shift_rel_indices]
+        return ce_per_entity
+
+
+class TemporalDistributionRatesLoss(TemporalDistributionLoss):
+    """Reconstruction loss over sub-steps for rates-mode variables with optional shift alignment.
+
+    This is a thin wrapper around TemporalDistributionLoss with mode fixed to "rates".
+    """
+
+    name: str = "temporal_distribution_rates"
+
+    def __init__(
+        self,
+        *,
+        ignore_nans: bool = False,
+        reconstruction: str = "mae",
+        huber_delta: float = 1.0,
+        shift_alignment: dict | None = None,
+        scale_by_sample_size: bool = False,
+    ) -> None:
+        super().__init__(
+            ignore_nans=ignore_nans,
+            mode="rates",
+            reconstruction=reconstruction,
+            huber_delta=huber_delta,
+            shift_alignment=shift_alignment,
+            scale_by_sample_size=scale_by_sample_size,
+        )
+
+    def _compute_temporal_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        inputs_are_log_probs: bool,
+        shift_rel_indices: list[int],
+    ) -> torch.Tensor:
+        eps = torch.finfo(pred.dtype).eps
+
+        def rec_over_time(p: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            if self.reconstruction == "mse":
+                err = (p - y) ** 2
+            elif self.reconstruction == "huber":
+                diff = p - y
+                abs_diff = diff.abs()
+                quadratic = torch.minimum(
+                    abs_diff,
+                    torch.tensor(self.huber_delta, device=diff.device, dtype=diff.dtype),
+                )
+                err = 0.5 * quadratic**2 + self.huber_delta * (abs_diff - quadratic)
+            else:
+                err = (p - y).abs()
+            return err.sum(dim=1)
+
+        # Base (no shift) reconstruction
+        rec_base = rec_over_time(pred, target)
+        if not self.shift_enabled or len(shift_rel_indices) == 0:
+            return rec_base
+
+        T = pred.shape[1]
+        rec_shifts: list[torch.Tensor] = []
+
+        for delta in self.shift_values:
+            if delta == 0:
+                p_shift = pred
+            elif delta > 0:
+                p_shift = torch.zeros_like(pred)
+                p_shift[:, delta:, ...] = pred[:, : T - delta, ...]
+            else:
+                d = -delta
+                p_shift = torch.zeros_like(pred)
+                p_shift[:, : T - d, ...] = pred[:, d:, ...]
+
+            # Restrict reconstruction to overlap
+            overlap_mask = self._build_overlap_mask(T, delta, pred.device, pred.dtype)
+            err = p_shift - target
+            if self.reconstruction == "mse":
+                err = err**2
+            elif self.reconstruction == "huber":
+                diff = err
+                abs_diff = diff.abs()
+                quadratic = torch.minimum(
+                    abs_diff,
+                    torch.tensor(self.huber_delta, device=diff.device, dtype=diff.dtype),
+                )
+                err = 0.5 * quadratic**2 + self.huber_delta * (abs_diff - quadratic)
+            else:
+                err = err.abs()
+
+            err_masked = err * overlap_mask
+
+            if self.shift_rates_normalization == "mean":
+                denom_bins = overlap_mask.sum(dim=1, keepdim=False).clamp_min(1.0)
+                rec_shift = err_masked.sum(dim=1) / denom_bins
+            elif self.shift_rates_normalization == "mass_mean":
+                y_masked = target * overlap_mask
+                cy = y_masked.sum(dim=1, keepdim=True).clamp_min(eps)
+                # mass-weighted mean: sum(y * err) / sum(y)
+                rec_shift = (err_masked * (y_masked / cy)).sum(dim=1)
+            else:  # 'sum'
+                rec_shift = err_masked.sum(dim=1)
+
+            rec_shifts.append(rec_shift)
+
+        rec_agg = self._aggregate_shifts(torch.stack(rec_shifts, dim=0))
+        loss_per_entity = rec_base.clone()
+        loss_per_entity[..., shift_rel_indices] = rec_agg[..., shift_rel_indices]
+        return loss_per_entity

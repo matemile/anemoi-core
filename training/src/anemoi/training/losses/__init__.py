@@ -16,7 +16,7 @@ from .loss import get_loss_function
 from .mae import MAELoss
 from .mse import MSELoss
 from .rmse import RMSELoss
-from .temporal_distribution import TemporalDistributionCrossEntropyLoss
+from .temporal_distribution import TemporalDistributionLoss
 from .weighted_mse import WeightedMSELoss
 
 __all__ = [
@@ -28,7 +28,7 @@ __all__ = [
     "MAELoss",
     "MSELoss",
     "RMSELoss",
-    "TemporalDistributionCrossEntropyLoss",
+    "TemporalDistributionLoss",
     "WeightedMSELoss",
     "get_loss_function",
 ]

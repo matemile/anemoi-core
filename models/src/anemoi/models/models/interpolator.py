@@ -136,9 +136,9 @@ class AnemoiModelEncProcDecInterpolator(AnemoiModelEncProcDec):
         if x_skip is not None:
             x_out[..., self._internal_output_idx] += x_skip[..., self._internal_input_idx]
         if x_skip_accum is not None and self.map_accum_indices is not None:
-            x_out[..., self.map_accum_indices["target_idxs"]] += x_skip_accum[
-                ..., self.map_accum_indices["constraint_idxs"]
-            ] / self.accum_window_size
+            x_out[..., self.map_accum_indices["target_idxs"]] += (
+                x_skip_accum[..., self.map_accum_indices["constraint_idxs"]] / self.accum_window_size
+            )
 
         for bounding in self.boundings:
             # bounding performed in the order specified in the config file
@@ -309,7 +309,7 @@ class AnemoiModelEncProcDecInterpolator(AnemoiModelEncProcDec):
                     y_preds, -2, apply_shard_shapes(y_preds, -2, grid_shard_shapes), model_comm_group
                 )
 
-        return y_preds
+        return y_preds  # shape(bs, interpolation_steps, ens, grid, n_vars) or shape(bs, interpolation_steps+1, ens, grid, n_vars) depending on whether mass conservation required an adjusted final timestep value away from the initial boundary value
 
     def resolve_mass_conservations(
         self,
@@ -662,3 +662,14 @@ class AnemoiModelEncProcDecInterpolator(AnemoiModelEncProcDec):
                 ),
                 requires_grad=False,
             )
+
+    def target_forcing(
+        self, interpolation_step: int, boundary_time_start_idx: int, boundary_time_end_idx: int
+    ) -> Tensor:
+
+        # TODO: In THE official PR to main This needs to be changed back to the version below:
+        # return (interpolation_step - boundary_time_start_idx) / (boundary_time_end_idx - boundary_time_start_idx)
+
+        return (
+            2 * (interpolation_step - boundary_time_start_idx) / (boundary_time_end_idx - boundary_time_start_idx) - 1
+        )

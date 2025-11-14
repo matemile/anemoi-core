@@ -183,7 +183,7 @@ class BaseImputer(BasePreprocessor, ABC):
                 x[..., idx_dst][nan_locations[..., idx_src]] = value
         return x
 
-    def transform(self, x: torch.Tensor, in_place: bool = True) -> torch.Tensor:
+    def transform(self, x: torch.Tensor, in_place: bool = True, **kwargs) -> torch.Tensor:
         """Impute missing values in the input tensor."""
         if not in_place:
             x = x.clone()
@@ -236,7 +236,7 @@ class BaseImputer(BasePreprocessor, ABC):
         # Replace values
         return self.fill_with_value(x, index, nan_locations, index)
 
-    def inverse_transform(self, x: torch.Tensor, in_place: bool = True) -> torch.Tensor:
+    def inverse_transform(self, x: torch.Tensor, in_place: bool = True, **kwargs) -> torch.Tensor:
         """Impute missing values in the input tensor."""
         if not in_place:
             x = x.clone()
@@ -417,7 +417,7 @@ class DynamicMixin:
                 x[..., idx][nan_locations[..., idx]] = value
         return x
 
-    def transform(self, x: torch.Tensor, in_place: bool = True) -> torch.Tensor:
+    def transform(self, x: torch.Tensor, in_place: bool = True, **kwargs) -> torch.Tensor:
         """Impute missing values in the input tensor."""
         if not in_place:
             x = x.clone()
@@ -442,7 +442,7 @@ class DynamicMixin:
 
         return self.fill_with_value(x, index, nan_locations)
 
-    def inverse_transform(self, x: torch.Tensor, in_place: bool = True) -> torch.Tensor:
+    def inverse_transform(self, x: torch.Tensor, in_place: bool = True, **kwargs) -> torch.Tensor:
         """Impute missing values in the input tensor."""
         return x
 
@@ -513,10 +513,10 @@ class DynamicCopyImputer(DynamicMixin, CopyImputer):
                 x[..., idx][nan_locations[..., idx]] = x[..., indices[value]][nan_locations[..., idx]]
         return x
 
-    def transform(self, x: torch.Tensor, in_place: bool = True) -> torch.Tensor:
+    def transform(self, x: torch.Tensor, in_place: bool = True, **kwargs) -> torch.Tensor:
         """Impute missing values in the input tensor."""
         return DynamicMixin.transform(self, x, in_place)
 
-    def inverse_transform(self, x: torch.Tensor, in_place: bool = True) -> torch.Tensor:
+    def inverse_transform(self, x: torch.Tensor, in_place: bool = True, **kwargs) -> torch.Tensor:
         """Impute missing values in the input tensor."""
         return DynamicMixin.inverse_transform(self, x, in_place)

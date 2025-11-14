@@ -86,7 +86,7 @@ class ZeroOverwriter(BasePreprocessor):
                 if idx not in self._infer_time_to_idxs[time_index]:
                     self._infer_time_to_idxs[time_index].append(idx)
 
-    def transform(self, x: Tensor, in_place: bool = True) -> Tensor:
+    def transform(self, x: Tensor, in_place: bool = True, **kwargs) -> Tensor:
         if not in_place:
             x = x.clone()
 
